@@ -167,12 +167,15 @@ function findAndRecordMissingJpxPdfs() {
     return;
   }
 
-  const newlyFoundPdfs = [];
+  Logger.log(`JPX チェック対象日付(${datesToCheck.length}件): ${datesToCheck.join(', ')}`);
+  const newlyFoundPdfs = [];
   for (const ymd of datesToCheck) {
     const url = `https://www.jpx.co.jp/markets/statistics-equities/margin/tvdivq0000001rnl-att/syumatsu${ymd}00.pdf`;
     try {
       const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-      if (response.getResponseCode() === 200) {
+      const code = response.getResponseCode();
+      Logger.log(`JPX ${ymd}: HTTP ${code}`);
+      if (code === 200) {
         const dateObj = new Date(ymd.slice(0, 4), ymd.slice(4, 6) - 1, ymd.slice(6, 8));
         const formattedDate = Utilities.formatDate(dateObj, 'JST', 'yyyy/MM/dd');
         newlyFoundPdfs.push([formattedDate, url]);
@@ -356,24 +359,26 @@ function sendToDiscord(message) {
     // 429: レート制限 → Retry-After に従って待機して再試行
     if (code === 429) {
       const bodyText = response.getContentText();
-      let waitSec = attempt * 2; // フォールバック（指数的）
-      try {
-        const body = JSON.parse(bodyText);
-        // Discordのwebhook 429は retry_after が「秒」。念のため極端に大きい値はミリ秒とみなす
-        if (body && typeof body.retry_after === 'number') {
-          waitSec = body.retry_after > 600 ? body.retry_after / 1000 : body.retry_after;
-        }
-        if (body && body.global === true) Logger.log('Discordグローバルレート制限を検知。');
-      } catch (parseErr) {
-        // JSONでない（Cloudflareのブロックページ等）→ ヘッダの Retry-After を見る
-        const headers = response.getAllHeaders();
-        const ra = headers['Retry-After'] || headers['retry-after'];
-        if (ra) { const h = parseFloat(ra); if (!isNaN(h)) waitSec = h; }
+      let parsed = null;
+      try { parsed = JSON.parse(bodyText); } catch (parseErr) { /* 非JSON応答 */ }
+
+      // 非JSONの429 = Cloudflareのエッジ規制（例: "error code: 1015"）。
+      // GASの共有IPに対するIP単位の規制で、同一実行内のリトライは同じIPから出るため無意味 → 即中断
+      if (!parsed) {
+        Logger.log(`Discord 429: Cloudflareエッジ規制（共有IP規制）の可能性。同一実行内リトライは無効のため中断。応答: ${bodyText.slice(0, 120)}`);
+        return false;
       }
-      waitSec = Math.min(Math.max(waitSec, 1), 60); // 1〜60秒に丸める
-      Logger.log(`Discord 429（レート制限）。${waitSec}秒待機して再試行 (試行${attempt}/${MAX_ATTEMPTS})。応答: ${bodyText.slice(0, 200)}`);
-      if (attempt < MAX_ATTEMPTS) { Utilities.sleep(Math.ceil(waitSec * 1000) + 300); continue; }
-      Logger.log('Discord通知: 429が続いたため断念しました。');
+
+      // ここからは Discord アプリ本体の 429（JSON）。retry_after は通常数秒なので短時間だけ再試行
+      let waitSec = attempt * 2;
+      if (typeof parsed.retry_after === 'number') {
+        waitSec = parsed.retry_after > 600 ? parsed.retry_after / 1000 : parsed.retry_after;
+      }
+      if (parsed.global === true) Logger.log('Discordグローバルレート制限を検知。');
+      waitSec = Math.min(Math.max(waitSec, 1), 10); // アプリ制限は数秒 → 上限10秒
+      Logger.log(`Discord 429（アプリ制限）。${waitSec}秒待機して再試行 (試行${attempt}/${MAX_ATTEMPTS})。`);
+      if (attempt < MAX_ATTEMPTS) { Utilities.sleep(Math.ceil(waitSec * 1000) + 200); continue; }
+      Logger.log('Discord通知: アプリ429が続いたため断念しました。');
       return false;
     }
 
