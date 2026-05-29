@@ -13,6 +13,14 @@
  */
 
 // ===============================================================
+// VPS中継設定（JPX需給PDF抽出）
+// GASの共有IPではpdftotextを実行できず、Drive OCRでは12列の数値表が崩れるため、
+// 専有IPのVPS（pdftotext -table）でPDFを解析し銘柄別の売り残/買い残JSONを取得する。
+// トークンはスクリプトプロパティ VPS_RELAY_TOKEN（VPSの .env RELAY_TOKEN と同値）。
+// ===============================================================
+const VPS_JPX_MARGIN_URL = 'http://168.110.60.126:10000/jpx/margin';
+
+// ===============================================================
 // スプレッドシートを開いた時の処理
 // ===============================================================
 /**
@@ -22,8 +30,10 @@
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('データ更新')
-    .addItem('1. JPXの未取得PDFを検索・記録', 'findAndRecordMissingJpxPdfs')
-    .addItem('2. 「JPX元データ」から取込', 'importJpxDataFromSheet')
+    .addItem('JPX需給を自動取込（VPS・推奨）', 'importJpxMarginFromVps')
+    .addSeparator()
+    .addItem('1. JPXの未取得PDFを検索・記録（手動・旧）', 'findAndRecordMissingJpxPdfs')
+    .addItem('2. 「JPX元データ」から取込（手動・旧）', 'importJpxDataFromSheet')
     .addSeparator() // メニューの区切り線
     .addItem('JPX毎日16:32の自動実行を設定', 'createDailyJpxTrigger')
     .addItem('JSDA毎日15:32の自動実行を設定', 'createDailyJsdaTrigger') // ★追加箇所
@@ -36,7 +46,7 @@ function onOpen() {
 // トリガー設定用関数
 // ===============================================================
 function createDailyJpxTrigger() {
-  const functionNameToTrigger = 'findAndRecordMissingJpxPdfs';
+  const functionNameToTrigger = 'importJpxMarginFromVps';
   const triggers = ScriptApp.getProjectTriggers();
   for (const trigger of triggers) {
     if (trigger.getHandlerFunction() === functionNameToTrigger) {
@@ -111,6 +121,125 @@ function handleSheetEdit(e) {
   if (sheetName === 'JPX元データ') {
     SpreadsheetApp.getActiveSpreadsheet().toast('「JPX元データ」の編集を検知。データ転記を実行します...', '自動実行中', 5);
     importJpxDataFromSheet();
+  }
+}
+
+// ===============================================================
+// JPX用：完全自動（VPS経由）
+// ===============================================================
+
+/**
+ * 【JPX用 完全自動】
+ * 「需給分析」シートでD/E列が未入力の日付について、VPS中継経由でJPX週末残PDFを解析し、
+ * 銘柄別の売り残（D列）・買い残（E列）を直接書き込む。
+ * 手動コピペ（JPX元データ貼付）もDiscord通知も不要。毎日16:32トリガーから呼ばれる。
+ */
+function importJpxMarginFromVps() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const juyouSheet = ss.getSheetByName('需給分析');
+  if (!juyouSheet) {
+    Logger.log('エラー：「需給分析」シートが見つかりません。');
+    try { SpreadsheetApp.getUi().alert('エラー：「需給分析」シートが見つかりません。'); } catch (uiErr) { /* トリガー時はUIなし */ }
+    return;
+  }
+
+  const data = juyouSheet.getDataRange().getValues();
+
+  // D/E列が未入力の日付を収集（findAndRecordMissingJpxPdfs と同じ判定）
+  const targetDates = new Set();
+  for (let i = 1; i < data.length; i++) {
+    const date = data[i][0];
+    const jpxSell = data[i][3];
+    const jpxBuy = data[i][4];
+    if (date instanceof Date && !jpxSell && !jpxBuy) {
+      targetDates.add(Utilities.formatDate(date, 'JST', 'yyyyMMdd'));
+    }
+  }
+
+  if (targetDates.size === 0) {
+    SpreadsheetApp.getActiveSpreadsheet().toast('JPXデータを入力すべき日付はありません。', '完了', 5);
+    return;
+  }
+
+  // 古い日付から処理（公開済みの過去分を確実に埋める）
+  const dates = [...targetDates].sort();
+  Logger.log(`JPX自動取込 対象日付(${dates.length}件): ${dates.join(', ')}`);
+
+  let totalUpdated = 0;
+  const processed = [];
+  for (const ymd of dates) {
+    const result = fetchJpxMarginFromVps_(ymd);
+    if (!result || !result.ok) {
+      // 404=JPX未公開（直近金曜分など）→ 正常スキップ。それ以外もログのみで継続
+      Logger.log(`JPX ${ymd}: スキップ (code=${(result && result.code) || ''} ${(result && result.error) || ''})`);
+      continue;
+    }
+
+    const marginMap = result.data || {};
+    if (Object.keys(marginMap).length === 0) {
+      Logger.log(`JPX ${ymd}: 解析結果が0件`);
+      continue;
+    }
+
+    // 該当日付かつD/E未入力の行へ書込（importJpxDataFromSheet と同じ転記ロジック）
+    let updated = 0;
+    for (let i = 1; i < data.length; i++) {
+      const rowDate = data[i][0];
+      if (!(rowDate instanceof Date)) continue;
+      if (Utilities.formatDate(rowDate, 'JST', 'yyyyMMdd') !== ymd) continue;
+      if (data[i][3] || data[i][4]) continue;
+      const code = String(data[i][1]);
+      const md = marginMap[code];
+      if (md) {
+        juyouSheet.getRange(i + 1, 4).setValue(md.sell);
+        juyouSheet.getRange(i + 1, 5).setValue(md.buy);
+        updated++;
+      }
+    }
+    if (updated > 0) {
+      totalUpdated += updated;
+      processed.push(`${ymd}:${updated}行`);
+    }
+    Logger.log(`JPX ${ymd}: ${updated}行更新（解析${Object.keys(marginMap).length}銘柄）`);
+  }
+
+  if (totalUpdated > 0) {
+    SpreadsheetApp.getActiveSpreadsheet().toast(`JPX需給を自動更新しました（${processed.join(', ')}）。`, '成功', 8);
+  } else {
+    SpreadsheetApp.getActiveSpreadsheet().toast('更新対象のデータはありませんでした（JPX未公開の可能性）。', '完了', 5);
+  }
+}
+
+/**
+ * VPS中継経由でJPX週末残PDFを解析し、銘柄別の売り残/買い残マップを取得する。
+ * @param {string} ymd - yyyyMMdd（週末金曜日）
+ * @returns {{ok:boolean, date?:string, count?:number, data?:Object, code?:number, error?:string}}
+ */
+function fetchJpxMarginFromVps_(ymd) {
+  const token = PropertiesService.getScriptProperties().getProperty('VPS_RELAY_TOKEN');
+  if (!token) {
+    Logger.log('VPS_RELAY_TOKEN が未設定です。スクリプトプロパティに設定してください（VPSの .env RELAY_TOKEN と同値）。');
+    return { ok: false, error: 'VPS_RELAY_TOKEN not set' };
+  }
+  try {
+    const res = UrlFetchApp.fetch(VPS_JPX_MARGIN_URL, {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: `Bearer ${token}` },
+      payload: JSON.stringify({ date: ymd }),
+      muteHttpExceptions: true
+    });
+    const code = res.getResponseCode();
+    const body = res.getContentText();
+    if (code === 404) return { ok: false, code: 404, error: 'JPX未公開' };
+    if (code !== 200) return { ok: false, code: code, error: body.slice(0, 200) };
+    try {
+      return JSON.parse(body);
+    } catch (parseErr) {
+      return { ok: false, code: code, error: 'JSON解析失敗: ' + body.slice(0, 120) };
+    }
+  } catch (e) {
+    return { ok: false, error: String(e) };
   }
 }
 
